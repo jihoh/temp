@@ -1,0 +1,76 @@
+Yes, I know *exactly* what you mean, and it's the most important and powerful way to test this entire system.
+
+You are describing a **full, end-to-end integration test** that treats the *entire* Disruptor pipeline as a single "black box." This is the definitive way to prove that all the handlers (`StateCommitHandler`, `RequestHandler`, `StrategyExecutionHandler`, `EgressCommandHandler`) are working together correctly.
+
+This is the only test that can catch subtle bugs in:
+* **Concurrency:** Handlers running on different threads correctly and safely modifying the `ActiveOrderStateCache`.
+* **State Management:** The `StateCommitHandler` correctly updating the `OrderLedger` based on events.
+* **Event-driven Logic:** A `MetaOrder` correctly triggering a `SEND_CHILD_ORDER_COMMAND`, which is then correctly acted upon by the `EgressCommandHandler`.
+* **Feedback Loops:** An `ExecutionReport` (published by a mock venue) correctly unblocking the right virtual thread in the `StrategyExecutionHandler`.
+
+Here is a blueprint for the "complex workflow" you're describing.
+
+### The Test Harness Setup
+
+To build this test, you will need:
+1.  **The System Under Test:** A fully wired-up Disruptor pipeline, just like in your `Main` class.
+2.  **Mock Venue Adapters:** You will create `Mock` instances of your `RFQVenueAAdapter` and `LitVenueBAdapter` (using a framework like Mockito). This is critical. You must pass these mocks into the `VenueGateway` so you can **intercept and verify** the outbound calls.
+3.  **Direct RingBuffer Access:** Your test method will hold a reference to the `ringBuffer` so it can publish events.
+
+
+
+[Image of an integration test workflow diagram]
+
+
+### A Complex Test Scenario: "Aggressive Sweep-to-Post"
+
+Here is a step-by-step simulation of a complex workflow and what you would assert at each stage.
+
+#### **Phase 1: System Setup**
+
+1.  **Start the SOR:** In your `@BeforeEach` method, set up the full Disruptor pipeline with your *mock* adapters.
+2.  **Publish Config:**
+    * Publish a `SOURCE_STRATEGY_MAP_UPDATE` to load your source mappings.
+    * Publish a `STRATEGY_DEFINITION_UPDATE` for a complex strategy named `"SWEEP_TO_POST"`. This strategy will be a `SequentialRouter` with two steps:
+        1.  An `AggressiveLimitRouter` (to sweep).
+        2.  A `PercentageRouter` with a `VenueRouter` (to post the remainder).
+3.  **Publish Market Data:**
+    * Publish a `MARKET_DATA_TICK` for "MSFT" with an ask price of $300.10 and 20,000 shares available.
+
+#### **Phase 2: The "Sweep"**
+
+4.  **Publish the Order:**
+    * Publish a `CREATE_ORDER_REQUEST` for a BUY, 50,000 shares of "MSFT" with a limit price of $300.15, using the `"SWEEP_TO_POST"` strategy.
+5.  **Wait and Verify (Sweep):**
+    * `Thread.sleep(100)` (to allow the event to be processed).
+    * The `RequestHandler` translates the request.
+    * The `StateCommitHandler` journals the new `MetaOrder`.
+    * The `StrategyExecutionHandler` launches the strategy.
+    * The `AggressiveLimitRouter` runs, sees the market data ($300.10), checks the limit ($300.15), and decides to sweep the 20,000 available shares.
+    * It publishes a `SEND_CHILD_ORDER_COMMAND`.
+    * The `EgressCommandHandler` receives this and calls the mock adapter.
+    * **ASSERTION:** You will `verify` that your mock `VenueAdapter`'s `sendOrder` method was called exactly **one time** with a `ChildOrder` for **20,000 shares**.
+
+#### **Phase 3: The "Post" (Simulating Fills)**
+
+6.  **Simulate the Fill:** The test now acts as the exchange.
+    * Publish an `EXECUTION_REPORT` with `OrderAction.ACK`.
+    * Publish an `EXECUTION_REPORT` with `OrderAction.FILL` for the 20,000 shares.
+7.  **Wait and Verify (Post):**
+    * `Thread.sleep(100)`.
+    * The `StateCommitHandler` journals the fill and updates the `MetaOrder`'s `filledQuantity` to 20,000.
+    * The `StrategyExecutionHandler` receives the fill, which unblocks the `AggressiveLimitRouter`'s virtual thread.
+    * The `SequentialRouter` moves to the next step: the `PercentageRouter`.
+    * This router sees the `ExecutionState` now has 30,000 shares remaining and routes them.
+    * It publishes a *new* `SEND_CHILD_ORDER_COMMAND`.
+    * The `EgressCommandHandler` receives this and calls the adapter again.
+    * **ASSERTION:** You will `verify` that your mock `VenueAdapter`'s `sendOrder` method was called a **second time** with a `ChildOrder` for the remaining **30,000 shares**.
+
+#### **Phase 4: Final State Validation**
+
+8.  **Simulate Final Fills:** Publish `ACK` and `FILL` reports for the 30,000 share order.
+9.  **Assert Final State:**
+    * `Thread.sleep(100)`.
+    * **ASSERTION:** Get the `MetaOrder` from the `sharedState.orderLedger()`. Assert that its `getFilledQuantity()` is **50,000** and its `getState()` is **`FILLED`**.
+
+This is exactly what you mean: a test that simulates the full, asynchronous, multi-step "conversation" with the SOR, proving that its complex internal logic and all its handlers work together as a single, cohesive unit.
